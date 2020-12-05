@@ -4,11 +4,14 @@
 
 extern crate libzfs_sys as sys;
 
+use std::ffi::{c_void, CStr, CString};
+use std::io::Error;
+use std::os::raw::c_int;
+use std::path::PathBuf;
+use std::ptr;
+
 use libzfs_types::{LibZfsError, Result};
 use nvpair;
-use std::ffi::{CStr, CString};
-use std::io::Error;
-use std::ptr;
 use zprop_list::{ZProp, ZpropItem, ZpropList};
 
 #[derive(Debug, PartialEq)]
@@ -106,6 +109,60 @@ impl Zfs {
 
         Ok(xs)
     }
+
+    pub fn dataset_exists<S: Into<String>>(&self, name: S) -> bool {
+        unsafe {
+            let x = CString::new(name.into()).unwrap();
+            let name = x.into_raw();
+
+            let ds = sys::zfs_path_to_zhandle((*self.raw).zfs_hdl, name, sys::zfs_type_dataset());
+            let _ = CString::from_raw(name);
+
+            if ds.is_null() {
+                false
+            } else {
+                true
+            }
+        }
+    }
+
+    pub fn list_datasets<S: Into<String>>(&self, name: S) -> Result<Vec<Zfs>> {
+        let sys::zfs_type_t(zfs_type) = sys::zfs_type_dataset();
+
+        let sub_name = {
+            let mut sub_path = PathBuf::from(self.name().into_string().unwrap());
+            sub_path.push(name.into());
+            sub_path.to_str().unwrap().to_string()
+        };
+
+        let x = unsafe {
+            let name = CString::new(sub_name).unwrap().into_raw();
+            let h = sys::zpool_get_handle((*self.raw).zpool_hdl);
+            let x = sys::zfs_open(h, name, zfs_type as c_int);
+            let _ = CString::from_raw(name);
+            assert!(!x.is_null(), "zfs_handle_t is null");
+            x
+        };
+
+        let _ds = Zfs::new(x);
+
+        unsafe extern "C" fn callback(handle: *mut sys::zfs_handle_t, state: *mut c_void) -> c_int {
+            let state = &mut *(state as *mut Vec<Zfs>);
+
+            state.push(Zfs::new(handle));
+
+            0
+        }
+
+        let mut state: Vec<Zfs> = Vec::new();
+        let state_ptr: *mut c_void = &mut state as *mut _ as *mut c_void;
+        let code = unsafe { sys::zfs_iter_filesystems(x, Some(callback), state_ptr) };
+
+        match code {
+            0 => Ok(state),
+            x => Err(LibZfsError::Io(Error::from_raw_os_error(x))),
+        }
+    }
 }
 
 impl Drop for Zfs {
@@ -116,16 +173,18 @@ impl Drop for Zfs {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use libzfs::Libzfs;
     use std::ffi::CString;
     use std::panic;
     use std::str;
+
+    use libzfs::Libzfs;
     use zprop_list::ZProp;
 
+    use super::*;
+
     fn zfs_by_name<F: Fn(&Zfs) -> ()>(name: &str, f: F) -> ()
-    where
-        F: panic::RefUnwindSafe,
+        where
+            F: panic::RefUnwindSafe,
     {
         let mut z = Libzfs::new();
 
@@ -173,7 +232,7 @@ mod tests {
                         "guid".to_owned(),
                         "createtxg".to_owned()
                     ]
-                    .contains(&x.name))
+                        .contains(&x.name))
                     .collect::<Vec<ZProp>>(),
                 vec![
                     ZProp {
